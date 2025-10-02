@@ -1,0 +1,364 @@
+import pandas as pd
+import numpy as np
+import streamlit as st
+
+# -----------------------
+# PASSWORD PROTECT
+# -----------------------
+def check_password():
+    """Returns True if the user entered the correct password."""
+    def password_entered():
+        if st.session_state["password"] == "Astra123#":   # change this!
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # Don't store password
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.text_input("Password", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.text_input("Password", type="password", on_change=password_entered, key="password")
+        st.error("😕 Password incorrect")
+        return False
+    else:
+        return True
+
+import datetime
+
+
+    # your full app logic here
+    # file upload, analysis, output display...
+
+# -----------------------
+# FUNCTIONS
+# -----------------------
+def clean_and_load(uploaded_file, target_date):
+    df = pd.read_csv(uploaded_file, dtype=str)
+    df["Date_clean"] = df["Date"].str.replace(
+        r"GMT\+0530 \(India Standard Time\)", "", regex=True
+    ).str.strip()
+    df["Date_clean"] = pd.to_datetime(df["Date_clean"], errors="coerce")
+
+    for col in ["Open","High","Low","Close","VWAP ‌VWAP‌ (n,n,n)","Volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["VWAP"] = df["VWAP ‌VWAP‌ (n,n,n)"]
+    df_day = df[df["Date_clean"].dt.date == pd.to_datetime(target_date).date()].copy()
+    df_day = df_day.sort_values("Date_clean").reset_index(drop=True)
+    return df_day
+
+
+def dalton_levels(df_day):
+    day_high = df_day["High"].max()
+    day_low  = df_day["Low"].min()
+    day_close = df_day["Close"].iloc[-1]
+
+    poc_row = df_day.groupby("Close")["Volume"].sum().idxmax()
+    poc = poc_row
+
+    prices = df_day.groupby("Close")["Volume"].sum().sort_index()
+    total_vol = prices.sum()
+    target_vol = total_vol * 0.7
+    center = prices.idxmax()
+    lows, highs = [center],[center]
+    vol_used = prices.loc[center]
+
+    sorted_prices = prices.index.tolist()
+    idx_center = sorted_prices.index(center)
+
+    i_low, i_high = idx_center-1, idx_center+1
+    while vol_used < target_vol and (i_low>=0 or i_high<len(sorted_prices)):
+        left_vol = prices.iloc[i_low] if i_low>=0 else 0
+        right_vol = prices.iloc[i_high] if i_high<len(sorted_prices) else 0
+        if right_vol >= left_vol and i_high<len(sorted_prices):
+            highs.append(sorted_prices[i_high]); vol_used += right_vol; i_high+=1
+        elif i_low>=0:
+            lows.append(sorted_prices[i_low]); vol_used += left_vol; i_low-=1
+        else:
+            break
+    vah, val = max(highs), min(lows)
+
+    ib = df_day.head(6)
+    ib_high, ib_low = ib["High"].max(), ib["Low"].min()
+
+    return {
+        "high": day_high, "low": day_low, "close": day_close,
+        "poc": poc, "vah": vah, "val": val,
+        "ib_high": ib_high, "ib_low": ib_low
+    }
+
+
+def dalton_filter(y_levels, today_df):
+    last_row = today_df.iloc[-1]
+    price, vwap, vol = last_row["Close"], last_row["VWAP"], last_row["Volume"]
+    med_vol = today_df["Volume"].rolling(20, min_periods=1).median().iloc[-1]
+
+    if vol > 1.3*med_vol and price > vwap:
+        actor = "Institutions buying (don’t want price to go down)"
+    elif vol > 1.3*med_vol and price < vwap:
+        actor = "Institutions selling (don’t want price to go up)"
+    elif vol <= 0.8*med_vol:
+        actor = "Retail driving weak moves"
+    else:
+        actor = "Dealers balancing around VWAP"
+
+    if price > y_levels["vah"]:
+        cond = f"Trading above yesterday VAH {y_levels['vah']} → breakout zone."
+    elif price < y_levels["val"]:
+        cond = f"Trading below yesterday VAL {y_levels['val']} → breakdown zone."
+    else:
+        cond = f"Inside yesterday’s value area ({y_levels['val']} – {y_levels['vah']})."
+
+    expected = []
+    if price < y_levels["val"] and vol > med_vol:
+        expected.append("If sellers keep control → may push toward yesterday’s Low.")
+    if price > y_levels["vah"] and vol > med_vol:
+        expected.append("If buyers hold above VAH → may target yesterday’s High.")
+    if y_levels["val"] <= price <= y_levels["vah"] and vol < med_vol:
+        expected.append("If volume stays low → dealers may balance around VWAP.")
+    if not expected:
+        expected.append("Unclear — wait for volume + direction clarity.")
+
+    return actor, cond, expected, vol, med_vol, last_row["Date_clean"]
+
+# -----------------------
+# STREAMLIT APP
+# -----------------------
+if check_password():
+    st.title("📊 Dalton + Conviction Analysis")
+
+# File uploaders
+yesterday_file = st.file_uploader("Upload Yesterday's CSV", type="csv")
+today_file = st.file_uploader("Upload Today's CSV", type="csv")
+
+# Inputs
+col1, col2 = st.columns(2)
+with col1:
+    yesterday_date = st.date_input("Yesterday's Date", datetime.date.today() - datetime.timedelta(days=1))
+with col2:
+    analysis_date = st.date_input("Today's Analysis Date", datetime.date.today())
+
+cutoff_time = st.text_input("Cutoff Time (HH:MM, leave blank for auto)", "")
+
+buffer_pts = 20.0
+target_R = 2.0
+lot_size = 75
+
+if yesterday_file and today_file:
+    # Load data
+    yesterday_df = clean_and_load(yesterday_file, yesterday_date)
+    today_df = clean_and_load(today_file, analysis_date)
+
+    # Apply cutoff
+    if cutoff_time.strip():
+        cutoff_obj = pd.to_datetime(cutoff_time).time()
+        today_df = today_df[today_df["Date_clean"].dt.time <= cutoff_obj]
+        cutoff_time_used = cutoff_time
+    else:
+        cutoff_time_used = str(today_df["Date_clean"].iloc[-1].time())
+
+    if today_df.empty:
+        st.error("⚠️ No today data after cutoff!")
+    else:
+        # Dalton Levels
+        y_levels = dalton_levels(yesterday_df)
+        dal_actor, dal_cond, dal_expect, dal_vol, dal_med, last_time = dalton_filter(y_levels, today_df)
+
+        st.subheader("📌 Dalton Prep Levels")
+        st.write(f"**High:** {y_levels['high']:.1f}, **Low:** {y_levels['low']:.1f}, **Close:** {y_levels['close']:.1f}")
+        st.write(f"**POC:** {y_levels['poc']:.1f}, **VAH:** {y_levels['vah']:.1f}, **VAL:** {y_levels['val']:.1f}")
+        st.write(f"**Initial Balance → High:** {y_levels['ib_high']:.1f}, Low: {y_levels['ib_low']:.1f}")
+
+        st.subheader("📌 Dalton Filter (Today)")
+        st.write(f"**Last Candle Time:** {last_time.time()}")
+        st.write(f"**Institutions/Dealers/Retail:** {dal_actor}")
+        st.write(f"**Condition:** {dal_cond}")
+        st.write(f"**Volume Check:** Current {dal_vol} vs Median {dal_med}")
+        st.write("**Expected Scenarios:**")
+        for e in dal_expect:
+            st.write("- " + e)
+
+        st.success("✅ Dalton + Conviction pipeline ready. Next step: Port full conviction analysis here.")
+        
+                # -----------------------
+        # CONVICTION ANALYSIS
+        # -----------------------
+        df_day = today_df.copy()
+
+        # Features
+        df_day["med20_vol"] = df_day["Volume"].rolling(20, min_periods=1).median()
+        df_day["v_ratio"] = df_day["Volume"] / df_day["med20_vol"]
+        df_day["range"] = (df_day["High"] - df_day["Low"]).replace(0, np.nan)
+        df_day["close_loc"] = (df_day["Close"] - df_day["Low"]) / df_day["range"]
+        df_day["above_vwap"] = df_day["Close"] > df_day["VWAP"]
+        df_day["below_vwap"] = df_day["Close"] < df_day["VWAP"]
+
+        last_row = df_day.iloc[-1]
+        close_loc = float(last_row.get("close_loc", 0.5))
+        v_ratio   = float(last_row.get("v_ratio", 1.0))
+        above     = bool(last_row.get("above_vwap", False))
+        below     = bool(last_row.get("below_vwap", False))
+
+        # Narrative
+        time_above = df_day["above_vwap"].mean()
+        bias = "bullish" if time_above > 0.65 else "bearish" if time_above < 0.35 else "neutral"
+
+        story = []
+        if bias == "bullish":
+            story.append("Price spent most of session above VWAP → dealer long bias.")
+        elif bias == "bearish":
+            story.append("Price spent most of session below VWAP → dealer short bias.")
+        else:
+            story.append("Price oscillated around VWAP → no clear dealer bias yet.")
+
+        df_day["absorp"] = (df_day["v_ratio"] > 2) & (df_day["range"] < df_day["range"].median())
+        if df_day["absorp"].any():
+            story.append("Institutions absorbed orders at VWAP zones (high volume, no breakout).")
+
+        traps = []
+        if df_day["above_vwap"].iloc[-5:].any() and below:
+            traps.append("Retailers trapped long after failed VWAP breakout.")
+        if (~df_day["above_vwap"].iloc[-5:]).any() and above:
+            traps.append("Retailers trapped short after failed VWAP breakdown.")
+
+        cond = []
+        cond.append("Currently trading above VWAP." if above else "Currently trading below VWAP.")
+        cond.append("Last candle closed strong near highs." if close_loc >= 0.7
+                    else "Last candle closed weak near lows." if close_loc <= 0.3
+                    else "Last candle closed mid-range.")
+        cond.append("High relative volume → institutions active." if v_ratio > 1.5
+                    else "Normal/low volume → retailers dominating.")
+
+        expect = []
+        if bias == "bullish" and above:
+            expect.append("Institutions defending VWAP to push UP.")
+        elif bias == "bearish" and below:
+            expect.append("Institutions defending VWAP to push DOWN.")
+        else:
+            expect.append("Institutions absorbing, direction unclear.")
+        if "trapped long" in " ".join(traps): expect.append("Retailers trapped long, fuel for downside.")
+        if "trapped short" in " ".join(traps): expect.append("Retailers trapped short, fuel for upside.")
+
+        # Trade Idea
+        trade = None
+        if below and close_loc <= 0.3 and v_ratio >= 1.1:
+            entry = last_row["Close"]; stop = last_row["High"] + buffer_pts
+            risk = stop-entry; target = entry - target_R*risk
+            trade = ("PRF Short", entry, stop, target, risk)
+        elif above and close_loc >= 0.7 and v_ratio >= 1.1:
+            entry = last_row["Close"]; stop = last_row["Low"] - buffer_pts
+            risk = entry-stop; target = entry + target_R*risk
+            trade = ("PRF Long", entry, stop, target, risk)
+
+        # VWAP Battle
+        recent5 = df_day.tail(5)
+        vwap_last = last_row["VWAP"]
+        diffs = (recent5["Close"] - recent5["VWAP"]).abs()
+        near_vwap = (diffs <= 10).sum()
+
+        auto_trade = None
+        if near_vwap < 3:
+            auto_trade = f"No trade setup → price not hugging VWAP (only {near_vwap}/5 candles near VWAP)"
+        else:
+            above_cnt = (recent5["Close"] > recent5["VWAP"]).sum()
+            below_cnt = (recent5["Close"] < recent5["VWAP"]).sum()
+            if above_cnt == below_cnt:
+                auto_trade = "No trade setup → VWAP battle indecisive"
+            else:
+                direction = "UP" if above_cnt > below_cnt else "DOWN"
+                last_vol = last_row["Volume"]
+                last_ma20 = last_row["med20_vol"]
+                pusher = "Institutions" if last_vol > last_ma20 else "Retail"
+                if pusher == "Retail":
+                    auto_trade = "No trade setup → VWAP battle weak, only Retail pushing"
+                else:
+                    battle = f"VWAP battle to go {direction}, pushing by {pusher}."
+                    if direction == "DOWN":
+                        entry = vwap_last - 8; stop = vwap_last + 10; target = vwap_last - 34
+                        risk = stop - entry; reward = entry - target
+                    else:
+                        entry = vwap_last + 8; stop = vwap_last - 10; target = vwap_last + 34
+                        risk = entry - stop; reward = target - entry
+                    rr_ratio = round(reward / risk, 2)
+                    auto_trade = f"{battle} | Entry: {entry:.1f} | Stop: {stop:.1f} | Target: {target:.1f} | R:R ≈ {rr_ratio}"
+
+        # Institutional Story
+        insto_story = []
+        if df_day["absorp"].any():
+            insto_story.append("Absorption at VWAP → institutions present, quietly building.")
+        if "trapped long" in " ".join(traps):
+            insto_story.append("Retailers trapped long → adds downside fuel.")
+        if "trapped short" in " ".join(traps):
+            insto_story.append("Retailers trapped short → adds upside fuel.")
+        if time_above > 0.7:
+            insto_story.append("Session spent >70% above VWAP → institutional lean LONG.")
+        elif time_above < 0.3:
+            insto_story.append("Session spent >70% below VWAP → institutional lean SHORT.")
+        else:
+            insto_story.append("Session balanced around VWAP → institutions undecided.")
+        if v_ratio > 1.5:
+            insto_story.append("Cutoff volume high → institutions pressing.")
+        else:
+            insto_story.append("Cutoff volume low → retail flow dominating.")
+
+        # Conviction Score
+        conviction_details = []
+        score = 0
+        if trade:
+            if "Long" in trade[0]: score += 1; conviction_details.append("PRF: LONG")
+            elif "Short" in trade[0]: score -= 1; conviction_details.append("PRF: SHORT")
+        else:
+            conviction_details.append("PRF: NONE")
+        if auto_trade and "VWAP battle to go UP" in auto_trade:
+            score += 1; conviction_details.append("VWAP Battle: LONG")
+        elif auto_trade and "VWAP battle to go DOWN" in auto_trade:
+            score -= 1; conviction_details.append("VWAP Battle: SHORT")
+        else:
+            conviction_details.append("VWAP Battle: NONE")
+        if any("lean LONG" in s for s in insto_story):
+            score += 1; conviction_details.append("Institutional Story: LONG")
+        elif any("lean SHORT" in s for s in insto_story):
+            score -= 1; conviction_details.append("Institutional Story: SHORT")
+        else:
+            conviction_details.append("Institutional Story: UNDECIDED")
+
+        if abs(score) == 3: conviction_text = "HIGH Conviction"
+        elif abs(score) == 2: conviction_text = "MEDIUM Conviction"
+        elif abs(score) == 1: conviction_text = "LOW Conviction"
+        else: conviction_text = "NO Conviction (conflict/neutral)"
+
+        # -----------------------
+        # STREAMLIT OUTPUT
+        # -----------------------
+        st.subheader("🎯 Conviction Score")
+        for d in conviction_details:
+            st.write("- " + d)
+        st.info(f"**Conviction Score = {score} → {conviction_text}**")
+
+        st.subheader("📖 Market Story")
+        for s in story: st.write("- " + s)
+        for t in traps: st.write("- " + t)
+
+        st.subheader("📌 Current Condition (Last 5 candles)")
+        for c in cond: st.write("- " + c)
+
+        st.subheader("🔮 Expected Behaviour")
+        for e in expect: st.write("- " + e)
+
+        st.subheader("💡 Trade Idea (PRF Manual)")
+        if trade:
+            setup, entry, stop, target, risk = trade
+            st.success(f"**Setup:** {setup}\n\nEntry: {entry:.1f} | Stop: {stop:.1f} | Risk: {risk:.1f} pts (₹{risk*lot_size:.0f})\n\nTarget: {target:.1f} | Reward: {target_R*risk:.1f} pts (₹{target_R*risk*lot_size:.0f})")
+        else:
+            st.warning("No clean setup at the moment.")
+
+        st.subheader("⚔️ Auto VWAP Battle Trade")
+        st.write(auto_trade)
+
+        st.subheader("🏦 Institutional Story Filter")
+        for i in insto_story: st.write("- " + i)
+
+        st.success("✅ Full Analysis Complete")
+
